@@ -32,6 +32,8 @@ L2_REGULARIZATION_STRENGTH = 0
 SILENCE_THRESHOLD = 0.3
 EPSILON = 0.001
 MOMENTUM = 0.9
+MAX_TO_KEEP = 5
+METADATA = False
 
 
 def get_arguments():
@@ -42,16 +44,15 @@ def get_arguments():
                              'boolean, got {}'.format(s))
         return {'true': True, 'false': False}[s.lower()]
 
-
     parser = argparse.ArgumentParser(description='WaveNet example network')
     parser.add_argument('--batch_size', type=int, default=BATCH_SIZE,
-                        help='How many wav files to process at once.')
+                        help='How many wav files to process at once. Default: ' + str(BATCH_SIZE) + '.')
     parser.add_argument('--data_dir', type=str, default=DATA_DIRECTORY,
                         help='The directory containing the VCTK corpus.')
-    parser.add_argument('--store_metadata', type=bool, default=False,
+    parser.add_argument('--store_metadata', type=bool, default=METADATA,
                         help='Whether to store advanced debugging information '
                         '(execution time, memory consumption) for use with '
-                        'TensorBoard.')
+                        'TensorBoard. Default: ' + str(METADATA) + '.')
     parser.add_argument('--logdir', type=str, default=None,
                         help='Directory in which to store the logging '
                         'information for TensorBoard. '
@@ -68,34 +69,40 @@ def get_arguments():
                         'This creates the new model under the dated directory '
                         'in --logdir_root. '
                         'Cannot use with --logdir.')
-    parser.add_argument('--checkpoint_every', type=int, default=CHECKPOINT_EVERY,
-                        help='How many steps to save each checkpoint after')
+    parser.add_argument('--checkpoint_every', type=int,
+                        default=CHECKPOINT_EVERY,
+                        help='How many steps to save each checkpoint after. Default: ' + str(CHECKPOINT_EVERY) + '.')
     parser.add_argument('--num_steps', type=int, default=NUM_STEPS,
-                        help='Number of training steps.')
+                        help='Number of training steps. Default: ' + str(NUM_STEPS) + '.')
     parser.add_argument('--learning_rate', type=float, default=LEARNING_RATE,
-                        help='Learning rate for training.')
+                        help='Learning rate for training. Default: ' + str(LEARNING_RATE) + '.')
     parser.add_argument('--wavenet_params', type=str, default=WAVENET_PARAMS,
-                        help='JSON file with the network parameters.')
+                        help='JSON file with the network parameters. Default: ' + WAVENET_PARAMS + '.')
     parser.add_argument('--sample_size', type=int, default=SAMPLE_SIZE,
                         help='Concatenate and cut audio samples to this many '
-                        'samples.')
+                        'samples. Default: ' + str(SAMPLE_SIZE) + '.')
     parser.add_argument('--l2_regularization_strength', type=float,
                         default=L2_REGULARIZATION_STRENGTH,
                         help='Coefficient in the L2 regularization. '
-                        'Disabled by default')
+                        'Default: False')
     parser.add_argument('--silence_threshold', type=float,
                         default=SILENCE_THRESHOLD,
                         help='Volume threshold below which to trim the start '
-                        'and the end from the training set samples.')
+                        'and the end from the training set samples. Default: ' + str(SILENCE_THRESHOLD) + '.')
     parser.add_argument('--optimizer', type=str, default='adam',
                         choices=optimizer_factory.keys(),
-                        help='Select the optimizer specified by this option.')
+                        help='Select the optimizer specified by this option. Default: adam.')
     parser.add_argument('--momentum', type=float,
                         default=MOMENTUM, help='Specify the momentum to be '
                         'used by sgd or rmsprop optimizer. Ignored by the '
-                        'adam optimizer.')
+                        'adam optimizer. Default: ' + str(MOMENTUM) + '.')
     parser.add_argument('--histograms', type=_str_to_bool, default=False,
-                         help='Whether to store histogram summaries.')
+                        help='Whether to store histogram summaries. Default: False')
+    parser.add_argument('--gc_channels', type=int, default=None,
+                        help='Number of global condition channels. Default: None. Expecting: Int')
+    parser.add_argument('--max_checkpoints', type=int, default=MAX_TO_KEEP,
+                        help='Maximum amount of checkpoints that will be kept alive. Default: '
+                             + str(MAX_TO_KEEP) + '.')
     return parser.parse_args()
 
 
@@ -189,7 +196,6 @@ def main():
         return
 
     logdir = directories['logdir']
-    logdir_root = directories['logdir_root']
     restore_from = directories['restore_from']
 
     # Even if we restored the model, we will treat it as new training
@@ -208,13 +214,23 @@ def main():
         # zero.
         silence_threshold = args.silence_threshold if args.silence_threshold > \
                                                       EPSILON else None
+        gc_enabled = args.gc_channels is not None
         reader = AudioReader(
             args.data_dir,
             coord,
             sample_rate=wavenet_params['sample_rate'],
+            gc_enabled=gc_enabled,
+            receptive_field=WaveNetModel.calculate_receptive_field(wavenet_params["filter_width"],
+                                                                   wavenet_params["dilations"],
+                                                                   wavenet_params["scalar_input"],
+                                                                   wavenet_params["initial_filter_width"]),
             sample_size=args.sample_size,
-            silence_threshold=args.silence_threshold)
+            silence_threshold=silence_threshold)
         audio_batch = reader.dequeue(args.batch_size)
+        if gc_enabled:
+            gc_id_batch = reader.dequeue_gc(args.batch_size)
+        else:
+            gc_id_batch = None
 
     # Create network.
     net = WaveNetModel(
@@ -228,10 +244,15 @@ def main():
         use_biases=wavenet_params["use_biases"],
         scalar_input=wavenet_params["scalar_input"],
         initial_filter_width=wavenet_params["initial_filter_width"],
-        histograms=args.histograms)
+        histograms=args.histograms,
+        global_condition_channels=args.gc_channels,
+        global_condition_cardinality=reader.gc_category_cardinality)
+
     if args.l2_regularization_strength == 0:
         args.l2_regularization_strength = None
-    loss = net.loss(audio_batch, args.l2_regularization_strength)
+    loss = net.loss(input_batch=audio_batch,
+                    global_condition_batch=gc_id_batch,
+                    l2_regularization_strength=args.l2_regularization_strength)
     optimizer = optimizer_factory[args.optimizer](
                     learning_rate=args.learning_rate,
                     momentum=args.momentum)
@@ -239,18 +260,18 @@ def main():
     optim = optimizer.minimize(loss, var_list=trainable)
 
     # Set up logging for TensorBoard.
-    writer = tf.train.SummaryWriter(logdir)
+    writer = tf.summary.FileWriter(logdir)
     writer.add_graph(tf.get_default_graph())
     run_metadata = tf.RunMetadata()
-    summaries = tf.merge_all_summaries()
+    summaries = tf.summary.merge_all()
 
     # Set up session
     sess = tf.Session(config=tf.ConfigProto(log_device_placement=False))
-    init = tf.initialize_all_variables()
+    init = tf.global_variables_initializer()
     sess.run(init)
 
     # Saver for storing checkpoints of the model.
-    saver = tf.train.Saver(var_list=tf.trainable_variables())
+    saver = tf.train.Saver(var_list=tf.trainable_variables(), max_to_keep=args.max_checkpoints)
 
     try:
         saved_global_step = load(saver, sess, restore_from)
@@ -269,8 +290,8 @@ def main():
     reader.start_threads(sess)
 
     step = None
+    last_saved_step = saved_global_step
     try:
-        last_saved_step = saved_global_step
         for step in range(saved_global_step + 1, args.num_steps):
             start_time = time.time()
             if args.store_metadata and step % 50 == 0:
